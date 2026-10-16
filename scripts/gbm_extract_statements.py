@@ -9,10 +9,13 @@ import pandas as pd
 from gbm_utils import (
     discover_statements,
     extract_between_headers,
+    extract_contract_id,
+    extract_statement_period,
     flatten_pages,
     following_numbers,
     is_number,
     load_config,
+    normalize_contract_id,
     normalize_text,
     parse_ddmmyyyy,
     parse_number,
@@ -31,6 +34,25 @@ MOVEMENT_DATE_RE = re.compile(r"^(?P<oper>\d{2})/(?P<liq>\d{2})$")
 def _clean_ticker(value: str) -> str:
     return value.replace("*", "").strip()
 
+def _parse_numeric_cells(line: str) -> list[float] | None:
+    """
+    Parse one or more numeric table cells that PyMuPDF may merge into a
+    single text line.
+
+    Example:
+        "0  56,200.000000" -> [0.0, 56200.0]
+
+    Returns None when the line contains any non-numeric token, so table
+    headings/tickers are never treated as numeric cells.
+    """
+    tokens = re.split(r"\s+", line.strip())
+    if not tokens:
+        return None
+    if not all(is_number(token) for token in tokens):
+        return None
+    return [parse_number(token) for token in tokens]
+
+
 
 def _summary_row_numbers(
     page1_lines: list[str],
@@ -40,27 +62,15 @@ def _summary_row_numbers(
     contains: bool = False,
     ignore_legacy_footnote: bool = False,
 ) -> list[float]:
-    """
-    Extract a row from page 1.
-
-    Legacy GBM PDFs (before April 2022) render the footnote marker in
-    "VALOR DEL PORTAFOLIO¹" as a separate numeric line containing just "1".
-    Without this guard that footnote is incorrectly parsed as a portfolio value.
-    """
     from gbm_utils import find_line, find_line_contains
 
     finder = find_line_contains if contains else find_line
     idx = finder(page1_lines, label)
 
     values: list[float] = []
-    for line in page1_lines[idx + 1:]:
+    for line in page1_lines[idx + 1 :]:
         if is_number(line):
-            # In legacy statements the superscript footnote becomes a standalone 1.
-            if (
-                ignore_legacy_footnote
-                and not values
-                and line.strip() in {"1", "¹"}
-            ):
+            if ignore_legacy_footnote and not values and line.strip() in {"1", "¹"}:
                 continue
             values.append(parse_number(line))
             if len(values) == count:
@@ -73,12 +83,48 @@ def _summary_row_numbers(
     )
 
 
-def extract_summary(page1_lines: list[str], meta) -> dict:
-    """
-    Extract the stable page-1 portfolio summary for both known GBM layouts:
-      * legacy_pre_2022_04
-      * modern_2022_04_plus
-    """
+def _statement_identity(path: Path, page1_lines: list[str]) -> dict:
+    meta = parse_statement_filename(path)
+    pdf_contract_id = extract_contract_id(page1_lines)
+    file_contract_id = normalize_contract_id(meta.contract_file_id)
+    contract_id = pdf_contract_id or file_contract_id
+
+    if not contract_id:
+        raise ValueError(f"Could not determine a contract ID for {path.name}")
+
+    printed_period = extract_statement_period(page1_lines)
+    if printed_period:
+        pdf_period_start, pdf_period_end = printed_period
+        period_matches_filename = (
+            pdf_period_start.year == meta.year
+            and pdf_period_start.month == meta.month
+        )
+    else:
+        pdf_period_start = None
+        pdf_period_end = None
+        period_matches_filename = None
+
+    contract_matches_filename = (
+        None
+        if pdf_contract_id is None or file_contract_id is None
+        else pdf_contract_id == file_contract_id
+    )
+
+    return {
+        "meta": meta,
+        "contract_id": contract_id,
+        "pdf_contract_id": pdf_contract_id,
+        "contract_file_id": file_contract_id,
+        "contract_matches_filename": contract_matches_filename,
+        "pdf_period_start": pdf_period_start,
+        "pdf_period_end": pdf_period_end,
+        "period_matches_filename": period_matches_filename,
+    }
+
+
+def extract_summary(page1_lines: list[str], identity: dict) -> dict:
+    meta = identity["meta"]
+
     variable_income = _summary_row_numbers(page1_lines, "RENTA VARIABLE", 3)
     cash = _summary_row_numbers(page1_lines, "EFECTIVO", 3)
     debt = _summary_row_numbers(page1_lines, "DEUDA", 3)
@@ -102,12 +148,14 @@ def extract_summary(page1_lines: list[str], meta) -> dict:
         except ValueError:
             return None
 
-    # Optional components differ slightly between legacy and modern statements.
     fund_of_funds = row("FONDO DE FONDOS")
     other_investments = row("OTRAS INVERSIONES")
     margin_credits = row("CREDITOS DE MARGEN")
     guarantees = row("GARANTÍAS")
     short_values = row("VALORES EN CORTO / PRÉSTAMO DE VALORES")
+
+    pdf_period_start = identity["pdf_period_start"]
+    pdf_period_end = identity["pdf_period_end"]
 
     return {
         "statement_date": meta.period_end.isoformat(),
@@ -115,8 +163,15 @@ def extract_summary(page1_lines: list[str], meta) -> dict:
         "month": meta.month,
         "year_month": meta.year_month,
         "layout_version": meta.layout_version,
-        "contract_file_id": meta.contract,
+        "contract_id": identity["contract_id"],
+        "pdf_contract_id": identity["pdf_contract_id"],
+        "contract_file_id": identity["contract_file_id"],
+        "contract_matches_filename": identity["contract_matches_filename"],
+        "pdf_period_start": pdf_period_start.isoformat() if pdf_period_start else None,
+        "pdf_period_end": pdf_period_end.isoformat() if pdf_period_end else None,
+        "period_matches_filename": identity["period_matches_filename"],
         "source_file": meta.path.name,
+        "source_path": str(meta.path.resolve()),
         "debt_previous_mxn": debt[0],
         "debt_current_mxn": debt[1],
         "variable_income_previous_mxn": variable_income[0],
@@ -167,23 +222,50 @@ def _looks_like_ticker(line: str) -> bool:
     return bool(TICKER_RE.fullmatch(text))
 
 
-def extract_holdings(all_lines: list[str], meta) -> list[dict]:
+def _extract_exact_section(
+    all_lines: list[str],
+    start_header: str,
+    end_headers: list[str],
+) -> list[str]:
     """
-    Parse the 'ACCIONES DEL SIC' holdings table without assuming a page number.
+    Extract a section using exact normalized header matches.
 
-    The April-2022+ format emits each table cell as a separate text line.
-    A normal row contains 10 numeric values after the issuer/ticker.
+    This is important for GBM because "ACCIONES" and "ACCIONES DEL SIC"
+    are different tables; a contains-based search would confuse them.
     """
-    try:
-        section = extract_between_headers(
-            all_lines,
-            "ACCIONES DEL SIC",
-            ["TOTAL: ACCIONES DEL SIC", "TOTAL: RENTA VARIABLE", "EFECTIVO"],
-        )
-    except ValueError:
+    start_normalized = normalize_text(start_header)
+    start_idx = None
+
+    for idx, line in enumerate(all_lines):
+        if normalize_text(line) == start_normalized:
+            start_idx = idx + 1
+            break
+
+    if start_idx is None:
         return []
 
+    end_normalized = {normalize_text(header) for header in end_headers}
+    end_idx = len(all_lines)
+
+    for idx in range(start_idx, len(all_lines)):
+        if normalize_text(all_lines[idx]) in end_normalized:
+            end_idx = idx
+            break
+
+    return all_lines[start_idx:end_idx]
+
+
+def _parse_holdings_section(
+    section: list[str],
+    identity: dict,
+    *,
+    holding_section: str,
+    market_scope: str,
+) -> list[dict]:
+    """Parse one GBM equity table (domestic ACCIONES or ACCIONES DEL SIC)."""
+    meta = identity["meta"]
     rows: list[dict] = []
+
     i = 0
     while i < len(section):
         line = section[i]
@@ -193,13 +275,16 @@ def extract_holdings(all_lines: list[str], meta) -> list[dict]:
 
         numeric_values: list[float] = []
         j = i + 1
+
         while j < len(section) and len(numeric_values) < 10:
             current = section[j]
-            if is_number(current):
-                numeric_values.append(parse_number(current))
-                j += 1
-            else:
+            parsed_cells = _parse_numeric_cells(current)
+            if parsed_cells is None:
                 break
+
+            remaining = 10 - len(numeric_values)
+            numeric_values.extend(parsed_cells[:remaining])
+            j += 1
 
         if len(numeric_values) == 10:
             (
@@ -220,7 +305,10 @@ def extract_holdings(all_lines: list[str], meta) -> list[dict]:
                     "statement_date": meta.period_end.isoformat(),
                     "year_month": meta.year_month,
                     "layout_version": meta.layout_version,
-                    "contract_file_id": meta.contract,
+                    "contract_id": identity["contract_id"],
+                    "contract_file_id": identity["contract_file_id"],
+                    "holding_section": holding_section,
+                    "market_scope": market_scope,
                     "ticker": _clean_ticker(line),
                     "quantity_previous": qty_previous,
                     "quantity_current": qty_current,
@@ -242,11 +330,63 @@ def extract_holdings(all_lines: list[str], meta) -> list[dict]:
     return rows
 
 
-def extract_monthly_returns(all_lines: list[str], meta) -> list[dict]:
+def extract_holdings(all_lines: list[str], identity: dict) -> list[dict]:
     """
-    Parse 'RENDIMIENTO DEL PORTAFOLIO' wherever it appears in the PDF.
-    GBM repeats several prior months, so build_gbm_history.py de-duplicates them.
+    Extract all equity holdings from a GBM statement.
+
+    GBM can split renta variable into at least two separate tables:
+      - ACCIONES: Mexican/local-market securities (for example GRUMA B)
+      - ACCIONES DEL SIC: securities listed through the SIC
+
+    Both tables are combined into the same holdings output so their market
+    values reconcile to RENTA VARIABLE in the statement summary.
     """
+    rows: list[dict] = []
+
+    domestic_section = _extract_exact_section(
+        all_lines,
+        "ACCIONES",
+        [
+            "Total: ACCIONES",
+            "ACCIONES DEL SIC",
+            "TOTAL: RENTA VARIABLE",
+            "EFECTIVO",
+        ],
+    )
+    if domestic_section:
+        rows.extend(
+            _parse_holdings_section(
+                domestic_section,
+                identity,
+                holding_section="ACCIONES",
+                market_scope="DOMESTIC",
+            )
+        )
+
+    sic_section = _extract_exact_section(
+        all_lines,
+        "ACCIONES DEL SIC",
+        [
+            "Total: ACCIONES DEL SIC",
+            "TOTAL: RENTA VARIABLE",
+            "EFECTIVO",
+        ],
+    )
+    if sic_section:
+        rows.extend(
+            _parse_holdings_section(
+                sic_section,
+                identity,
+                holding_section="ACCIONES DEL SIC",
+                market_scope="SIC",
+            )
+        )
+
+    return rows
+
+
+def extract_monthly_returns(all_lines: list[str], identity: dict) -> list[dict]:
+    meta = identity["meta"]
     try:
         section = extract_between_headers(
             all_lines,
@@ -278,9 +418,8 @@ def extract_monthly_returns(all_lines: list[str], meta) -> list[dict]:
         while j < len(section) and len(numbers) < 4:
             if is_number(section[j]):
                 numbers.append(parse_number(section[j]))
-            else:
-                if numbers:
-                    break
+            elif numbers:
+                break
             j += 1
 
         if len(numbers) == 4:
@@ -298,7 +437,8 @@ def extract_monthly_returns(all_lines: list[str], meta) -> list[dict]:
                     "source_statement_date": meta.period_end.isoformat(),
                     "layout_version": meta.layout_version,
                     "source_file": meta.path.name,
-                    "contract_file_id": meta.contract,
+                    "contract_id": identity["contract_id"],
+                    "contract_file_id": identity["contract_file_id"],
                 }
             )
             i = j
@@ -336,17 +476,8 @@ def _classify_movement(description: str) -> str:
     return "other"
 
 
-def extract_movements(all_lines: list[str], meta) -> list[dict]:
-    """
-    Extract movement records across pages.
-
-    Because descriptions can wrap and the table can span pages, each record is
-    captured from one FECHA OPER/LIQ token to the next. The parser intentionally
-    keeps raw_record_text for auditability.
-
-    external_flow_mxn is populated only for contributions/withdrawals, which is
-    the key field needed to separate investment performance from new savings.
-    """
+def extract_movements(all_lines: list[str], identity: dict) -> list[dict]:
+    meta = identity["meta"]
     try:
         section = extract_between_headers(
             all_lines,
@@ -361,8 +492,7 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
         return []
 
     start_indices = [
-        i for i, line in enumerate(section)
-        if MOVEMENT_DATE_RE.match(line.strip())
+        i for i, line in enumerate(section) if MOVEMENT_DATE_RE.match(line.strip())
     ]
 
     rows: list[dict] = []
@@ -370,8 +500,6 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
         end = start_indices[pos + 1] if pos + 1 < len(start_indices) else len(section)
         record = section[start:end]
 
-        # Remove page footers/headers that can appear between the last record
-        # on one page and the first record on the next page.
         for stop_idx, token in enumerate(record):
             if normalize_text(token).startswith("HOJA:"):
                 record = record[:stop_idx]
@@ -387,9 +515,6 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
         operation_day = int(date_match.group("oper"))
         liquidation_day = int(date_match.group("liq"))
 
-        # Legacy PDFs often combine FOLIO + DESCRIPTION in a single extracted
-        # text line (e.g. "190604298 Compra en Reporto"). Newer PDFs normally
-        # extract them as separate lines. Support both forms.
         folio_token = record[1].strip()
         combined = re.match(r"^(?P<folio>\d+)\s+(?P<description>.+)$", folio_token)
         if combined:
@@ -437,14 +562,15 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
             elif category == "withdrawal":
                 external_flow = -abs(net)
 
+        operation_date = safe_date(meta.year, meta.month, operation_day)
+        flow_id = f"{identity['contract_id']}|{operation_date.isoformat()}|{folio}|{meta.path.name}"
+
         rows.append(
             {
                 "statement_date": meta.period_end.isoformat(),
                 "year_month": meta.year_month,
                 "layout_version": meta.layout_version,
-                "operation_date": safe_date(
-                    meta.year, meta.month, operation_day
-                ).isoformat(),
+                "operation_date": operation_date.isoformat(),
                 "operation_day": operation_day,
                 "liquidation_day": liquidation_day,
                 "folio": folio,
@@ -454,8 +580,10 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
                 "net_mxn_reported": net,
                 "balance_mxn_reported": balance,
                 "external_flow_mxn": external_flow,
+                "flow_id": flow_id,
                 "raw_record_text": " | ".join(record),
-                "contract_file_id": meta.contract,
+                "contract_id": identity["contract_id"],
+                "contract_file_id": identity["contract_file_id"],
                 "source_file": meta.path.name,
             }
         )
@@ -464,42 +592,52 @@ def extract_movements(all_lines: list[str], meta) -> list[dict]:
 
 
 def parse_statement(path: Path) -> tuple[dict, list[dict], list[dict], list[dict]]:
-    meta = parse_statement_filename(path)
     pages = pdf_pages_as_lines(path)
-
     if not pages:
         raise ValueError(f"No text pages found in {path.name}")
 
+    identity = _statement_identity(path, pages[0])
     all_lines = flatten_pages(pages)
 
-    summary = extract_summary(pages[0], meta)
-    holdings = extract_holdings(all_lines, meta)
-    returns = extract_monthly_returns(all_lines, meta)
-    movements = extract_movements(all_lines, meta)
+    summary = extract_summary(pages[0], identity)
+    holdings = extract_holdings(all_lines, identity)
+    returns = extract_monthly_returns(all_lines, identity)
+    movements = extract_movements(all_lines, identity)
 
     return summary, holdings, returns, movements
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Parse legacy and modern GBM PDF statements."
+        description="Parse legacy and modern GBM PDF statements with multi-contract support."
     )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="Path to .config. Defaults to <project>/.config.",
-    )
-    parser.add_argument(
-        "--input",
-        default=None,
-        help="Override the GBM statement folder from .config.",
-    )
-    parser.add_argument(
-        "--output",
-        default=None,
-        help="Override output folder. Default: gbm/processed.",
-    )
+    parser.add_argument("--config", default=None)
+    parser.add_argument("--input", default=None)
+    parser.add_argument("--output", default=None)
     return parser.parse_args()
+
+
+def _validate_contract_mode(summary: dict, mode: str) -> None:
+    mismatch = summary.get("contract_matches_filename") is False
+    if not mismatch:
+        return
+
+    message = (
+        f"Contract mismatch in {summary['source_file']}: filename token "
+        f"'{summary['contract_file_id']}' != PDF contract '{summary['contract_id']}'."
+    )
+    if mode == "error":
+        raise ValueError(message)
+    if mode == "warn":
+        print(f"[WARN] {message}")
+
+
+def _find_duplicate_contract_months(summary_df: pd.DataFrame) -> pd.DataFrame:
+    if summary_df.empty:
+        return pd.DataFrame()
+    return summary_df[
+        summary_df.duplicated(subset=["contract_id", "year_month"], keep=False)
+    ].sort_values(["contract_id", "year_month", "source_file"])
 
 
 def main() -> None:
@@ -512,19 +650,20 @@ def main() -> None:
     elif configured_input:
         input_dir = resolve_project_path(configured_input)
     else:
-        raise KeyError(
-            "Missing path_gbm_edo_cta in .config and no --input was provided."
-        )
+        raise KeyError("Missing path_gbm_edo_cta in .config and no --input was provided.")
 
     output_dir = resolve_project_path(
-        args.output
-        or config.get("path_gbm_processed", "gbm/processed")
+        args.output or config.get("path_gbm_processed", "gbm/processed")
     )
+
+    contract_validation = config.get("contract_validation", "warn").strip().lower()
+    if contract_validation not in {"error", "warn", "off"}:
+        raise ValueError("contract_validation must be one of: error, warn, off")
 
     pdfs = discover_statements(input_dir)
     if not pdfs:
         raise FileNotFoundError(
-            f"No supported CB_YYYYM_Contrato.pdf files found under {input_dir}"
+            f"No CB_YYYYM_Contrato.pdf files found under {input_dir}"
         )
 
     summaries: list[dict] = []
@@ -535,15 +674,16 @@ def main() -> None:
 
     for pdf in pdfs:
         try:
-            summary, statement_holdings, statement_returns, statement_movements = (
-                parse_statement(pdf)
-            )
+            summary, statement_holdings, statement_returns, statement_movements = parse_statement(pdf)
+            if contract_validation != "off":
+                _validate_contract_mode(summary, contract_validation)
+
             summaries.append(summary)
             holdings.extend(statement_holdings)
             returns.extend(statement_returns)
             movements.extend(statement_movements)
             print(
-                f"[OK] {pdf.name}: "
+                f"[OK] {pdf.name} -> contract {summary['contract_id']}: "
                 f"{len(statement_holdings)} holdings, "
                 f"{len(statement_returns)} return rows, "
                 f"{len(statement_movements)} movements"
@@ -553,6 +693,7 @@ def main() -> None:
             errors.append(
                 {
                     "source_file": pdf.name,
+                    "source_path": str(pdf.resolve()),
                     "error_type": type(exc).__name__,
                     "error": str(exc),
                 }
@@ -565,20 +706,20 @@ def main() -> None:
     errors_df = pd.DataFrame(errors)
 
     if not summary_df.empty:
-        summary_df = summary_df.sort_values(
-            ["statement_date", "contract_file_id"]
-        )
+        summary_df = summary_df.sort_values(["statement_date", "contract_id", "source_file"])
     if not holdings_df.empty:
-        holdings_df = holdings_df.sort_values(
-            ["statement_date", "ticker"]
-        )
+        holdings_df = holdings_df.sort_values(["statement_date", "contract_id", "ticker"])
     if not returns_df.empty:
-        returns_df = returns_df.sort_values(
-            ["period_end", "source_statement_date"]
-        )
+        returns_df = returns_df.sort_values(["period_end", "contract_id", "source_statement_date"])
     if not movements_df.empty:
-        movements_df = movements_df.sort_values(
-            ["operation_date", "folio"]
+        movements_df = movements_df.sort_values(["operation_date", "contract_id", "folio"])
+
+    duplicates = _find_duplicate_contract_months(summary_df)
+    if not duplicates.empty:
+        write_table(duplicates, output_dir / "duplicate_statements")
+        raise ValueError(
+            "Duplicate canonical contract/month statements were found. "
+            f"Review {output_dir / 'duplicate_statements.csv'} before continuing."
         )
 
     write_table(summary_df, output_dir / "statement_summary")
@@ -591,6 +732,9 @@ def main() -> None:
 
     print(f"\nOutput written to: {output_dir}")
     print("CSV is always created; Parquet is also created when pyarrow is installed.")
+
+    if errors:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":
