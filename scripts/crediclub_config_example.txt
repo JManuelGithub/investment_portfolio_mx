@@ -1,0 +1,20 @@
+
+# Crediclub / SuperTasas
+path_crediclub_edo_cta = "crediclub/edo_cta"
+path_crediclub_processed = "crediclub/processed"
+
+# Logical relationship ID used to keep continuity if Crediclub changes the
+# statement account number during a product/layout migration.
+crediclub_relationship_id = "CREDICLUB_PRIMARY"
+
+# Real statements may require the RFC as the PDF password.
+# Prefer the environment variable CREDICLUB_PDF_PASSWORD when possible.
+#
+# PowerShell example for the current session:
+# $env:CREDICLUB_PDF_PASSWORD = "YOUR_RFC"
+#
+# Or configure locally in .config (which should remain gitignored):
+# crediclub_pdf_password = "YOUR_RFC"
+#
+# Alternative:
+# crediclub_rfc = "YOUR_RFC"
