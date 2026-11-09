@@ -1,0 +1,11 @@
+# Santander
+path_santander_edo_cta = "santander/edo_cta"
+path_santander_processed = "santander/processed"
+
+# Optional OCR settings
+# path_tesseract_exe = "C:/Program Files/Tesseract-OCR/tesseract.exe"
+santander_ocr_dpi = 180
+santander_ocr_psm = 11
+
+# Spanish is required for reliable Santander movement-table OCR
+santander_ocr_language = "spa+eng"
